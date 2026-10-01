@@ -1,0 +1,93 @@
+name: FOSSA
+
+on:
+  pull_request:                 # required: every PR
+  push:
+    branches: [master]          # baseline scans of the default branch (enables --diff later)
+  workflow_dispatch:            # manual re-run for troubleshooting
+
+permissions:
+  contents: read                # least privilege for GITHUB_TOKEN
+
+concurrency:
+  group: fossa-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fossa:
+    name: FOSSA analyze + policy test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FOSSA_API_KEY: ${{ secrets.FOSSA_API_KEY }}             # read natively by the CLI, never on the command line
+      FOSSA_BRANCH: ${{ github.head_ref || github.ref_name }}
+      FOSSA_REV: ${{ github.sha }}                             # same revision for analyze and test
+    defaults:
+      run:
+        shell: bash             # explicit bash => -o pipefail, so `| tee` can't hide a failure
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify FOSSA secret is available
+        run: |
+          if [ -z "$FOSSA_API_KEY" ]; then
+            echo "::error title=FOSSA_API_KEY missing::Add FOSSA_API_KEY as a repository secret. PRs from forks do not receive secrets."
+            exit 1
+          fi
+
+      - name: Install FOSSA CLI
+        run: |
+          curl -fsSL -H 'Cache-Control: no-cache' \
+            https://raw.githubusercontent.com/fossas/fossa-cli/master/install-latest.sh | bash
+          fossa --version
+
+      - name: List detected targets
+        run: fossa list-targets
+
+      - name: FOSSA analyze (build dependency graph and upload)
+        id: analyze
+        run: fossa analyze ${RUNNER_DEBUG:+--debug} --branch "$FOSSA_BRANCH" --revision "$FOSSA_REV" --json | tee fossa-analyze.json
+
+      - name: FOSSA test (license + vulnerability policy gate)
+        id: test
+        run: fossa test ${RUNNER_DEBUG:+--debug} --revision "$FOSSA_REV" 2>&1 | tee fossa-test.txt
+
+      - name: Capture machine-readable results
+        if: always() && steps.analyze.outcome == 'success'
+        run: fossa test --revision "$FOSSA_REV" --format json > fossa-test.json || true
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          url=$(jq -r '.url // empty' fossa-analyze.json 2>/dev/null || true)
+          {
+            echo "## FOSSA scan: \`$FOSSA_BRANCH\` @ \`${FOSSA_REV:0:7}\`"
+            echo
+            echo "| Step | Result |"
+            echo "|---|---|"
+            echo "| Analyze (upload) | ${{ steps.analyze.outcome }} |"
+            echo "| Test (policy gate) | ${{ steps.test.outcome }} |"
+            echo
+            [ -n "$url" ] && echo "Full results (Licensing and Security tabs): $url" && echo
+            echo '```'
+            cat fossa-test.txt 2>/dev/null || echo "fossa test did not run. See the failing step above."
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.test.outcome }}" = "failure" ]; then
+            echo "::error title=FOSSA policy check failed::Issues violate the project's FOSSA policy. See the job summary."
+          fi
+
+      - name: Upload FOSSA results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fossa-results-${{ github.run_id }}
+          path: |
+            fossa-analyze.json
+            fossa-test.txt
+            fossa-test.json
+            fossa.debug.*
+          if-no-files-found: ignore
+          retention-days: 14
