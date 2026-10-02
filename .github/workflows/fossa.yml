@@ -1,17 +1,17 @@
 name: FOSSA
 
 on:
-  pull_request:                 # required: every PR
+  pull_request:                 # required: every PR (opened, synchronize, reopened)
   push:
-    branches: [master]          # baseline scans of the default branch (enables --diff later)
+    branches: [master]          # baseline scans of master (repo default branch), enables `fossa test --diff` later
   workflow_dispatch:            # manual re-run for troubleshooting
 
 permissions:
-  contents: read                # least privilege for GITHUB_TOKEN
+  contents: read                # least privilege for GITHUB_TOKEN; FOSSA needs nothing from it
 
 concurrency:
   group: fossa-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: true      # a new push to the PR cancels the stale scan
 
 jobs:
   fossa:
@@ -19,12 +19,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      FOSSA_API_KEY: ${{ secrets.FOSSA_API_KEY }}             # read natively by the CLI, never on the command line
-      FOSSA_BRANCH: ${{ github.head_ref || github.ref_name }}
-      FOSSA_REV: ${{ github.sha }}                             # same revision for analyze and test
+      FOSSA_API_KEY: ${{ secrets.FOSSA_API_KEY }}             # read natively by the CLI, never passed as an argument
+      FOSSA_BRANCH: ${{ github.head_ref || github.ref_name }} # PR source branch, or main on push
+      FOSSA_REV: ${{ github.sha }}                             # exact commit checked out (merge commit on PRs)
     defaults:
       run:
-        shell: bash             # explicit bash => -o pipefail, so `| tee` can't hide a failure
+        shell: bash             # explicit bash => GitHub adds -o pipefail, so `| tee` cannot swallow a failure
 
     steps:
       - name: Checkout
@@ -33,7 +33,7 @@ jobs:
       - name: Verify FOSSA secret is available
         run: |
           if [ -z "$FOSSA_API_KEY" ]; then
-            echo "::error title=FOSSA_API_KEY missing::Add FOSSA_API_KEY as a repository secret. PRs from forks do not receive secrets."
+            echo "::error title=FOSSA_API_KEY missing::Add FOSSA_API_KEY as a repository or org secret. PRs from forks do not receive secrets."
             exit 1
           fi
 
@@ -48,20 +48,32 @@ jobs:
 
       - name: FOSSA analyze (build dependency graph and upload)
         id: analyze
-        run: fossa analyze ${RUNNER_DEBUG:+--debug} --branch "$FOSSA_BRANCH" --revision "$FOSSA_REV" --json | tee fossa-analyze.json
+        run: |
+          # "Re-run jobs > Enable debug logging" sets RUNNER_DEBUG=1, which adds --debug (debug bundle for support)
+          # --json prints project metadata (incl. FOSSA URL) to stdout; logs go to stderr
+          fossa analyze ${RUNNER_DEBUG:+--debug} --branch "$FOSSA_BRANCH" --revision "$FOSSA_REV" --json | tee fossa-analyze.json
 
       - name: FOSSA test (license + vulnerability policy gate)
         id: test
-        run: fossa test ${RUNNER_DEBUG:+--debug} --revision "$FOSSA_REV" 2>&1 | tee fossa-test.txt
+        run: |
+          # Waits for FOSSA's server-side scan, then exits 0 (no issues) or 1 (policy issues found).
+          fossa test ${RUNNER_DEBUG:+--debug} --revision "$FOSSA_REV" 2>&1 | tee fossa-test.txt
 
       - name: Capture machine-readable results
         if: always() && steps.analyze.outcome == 'success'
         run: fossa test --revision "$FOSSA_REV" --format json > fossa-test.json || true
 
-      - name: Generate third-party notices
-        if: github.event_name == 'push' && steps.analyze.outcome == 'success'
+      # NEW: attribution notice + SBOM for every build (PRs, master pushes, manual runs).
+      # Runs even if the policy gate failed, so a failing build still has its notices and SBOM.
+      # continue-on-error: a report hiccup never fails the build; the policy gate above stays the only gate.
+      - name: Generate attribution notice and SBOM
+        id: reports
+        if: always() && steps.analyze.outcome == 'success'
+        continue-on-error: true
         run: |
-          fossa report attribution --revision "$FOSSA_REV" --format text > THIRD_PARTY_NOTICES.txt
+          fossa report attribution --revision "$FOSSA_REV" --timeout 600 --format text           > THIRD_PARTY_NOTICES.txt
+          fossa report attribution --revision "$FOSSA_REV" --timeout 600 --format cyclonedx-json > sbom.cdx.json
+          fossa report attribution --revision "$FOSSA_REV" --timeout 600 --format spdx-json      > sbom.spdx.json
 
       - name: Publish job summary
         if: always()
@@ -74,14 +86,20 @@ jobs:
             echo "|---|---|"
             echo "| Analyze (upload) | ${{ steps.analyze.outcome }} |"
             echo "| Test (policy gate) | ${{ steps.test.outcome }} |"
+            echo "| Attribution + SBOM | ${{ steps.reports.outcome }} |"
             echo
             [ -n "$url" ] && echo "Full results (Licensing and Security tabs): $url" && echo
+            echo "Notices and SBOMs: see the \`fossa-results-${{ github.run_id }}\` artifact below."
+            echo
+            echo "<details open><summary>fossa test output</summary>"
+            echo
             echo '```'
             cat fossa-test.txt 2>/dev/null || echo "fossa test did not run. See the failing step above."
             echo '```'
+            echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "${{ steps.test.outcome }}" = "failure" ]; then
-            echo "::error title=FOSSA policy check failed::Issues violate the project's FOSSA policy. See the job summary."
+            echo "::error title=FOSSA policy check failed::License or vulnerability issues violate the project's FOSSA policy. See the job summary."
           fi
 
       - name: Upload FOSSA results
@@ -93,6 +111,9 @@ jobs:
             fossa-analyze.json
             fossa-test.txt
             fossa-test.json
+            THIRD_PARTY_NOTICES.txt
+            sbom.cdx.json
+            sbom.spdx.json
             fossa.debug.*
           if-no-files-found: ignore
           retention-days: 14
