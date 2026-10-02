@@ -58,6 +58,11 @@ jobs:
         if: always() && steps.analyze.outcome == 'success'
         run: fossa test --revision "$FOSSA_REV" --format json > fossa-test.json || true
 
+      - name: Generate third-party notices
+        if: github.event_name == 'push' && steps.analyze.outcome == 'success'
+        run: |
+          fossa report attribution --revision "$FOSSA_REV" --format text > THIRD_PARTY_NOTICES.txt
+
       - name: Publish job summary
         if: always()
         run: |
